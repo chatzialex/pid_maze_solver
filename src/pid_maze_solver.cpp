@@ -1,3 +1,6 @@
+#include "pid_maze_solver/goals.hpp"
+#include "pid_maze_solver/goals_yaml.hpp"
+
 #include "rclcpp/logging.hpp"
 #include "rclcpp/node.hpp"
 #include "rclcpp/publisher.hpp"
@@ -7,7 +10,12 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 
+#include "ament_index_cpp/get_package_share_directory.hpp"
+#include "yaml-cpp/yaml.h"
+#include <filesystem>
+
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -25,16 +33,6 @@ using Twist = geometry_msgs::msg::Twist;
 using namespace std::chrono_literals;
 
 namespace PidMazeSolver {
-
-struct Point2D {
-  double x;
-  double y;
-};
-
-struct Goal {
-  std::optional<Point2D> position;
-  std::optional<Point2D> heading;
-};
 
 double getYaw(const Quaternion &quaternion) {
   tf2::Quaternion q{quaternion.x, quaternion.y, quaternion.z, quaternion.w};
@@ -55,11 +53,10 @@ public:
                                                 std::placeholders::_1))},
         twist_pub_{
             this->create_publisher<Twist>(kCommandVelocityTopicName, 1)} {
-
     RCLCPP_INFO(this->get_logger(), "%s node started.", node_name.c_str());
   }
 
-  bool followTrajectory(std::vector<Goal> goals);
+  bool followTrajectory(GoalSequence goals);
 
 private:
   struct State {
@@ -89,7 +86,7 @@ private:
   double pidStepHeading(double e, double de, double ie);
 
   void odomSubCb(const std::shared_ptr<const Odometry> msg);
-  bool goToGoal(const Goal &goal);
+  bool goToGoal(const Point2D &goal);
 
   rclcpp::Subscription<Odometry>::SharedPtr odom_sub_{};
   rclcpp::Publisher<Twist>::SharedPtr twist_pub_{};
@@ -111,62 +108,58 @@ void PidMazeSolver::odomSubCb(const std::shared_ptr<const Odometry> msg) {
                 msg->twist.twist.linear.y,          msg->twist.twist.angular.z};
 }
 
-bool PidMazeSolver::goToGoal(const Goal &goal) {
+bool PidMazeSolver::goToGoal(const Point2D &point) {
+  RCLCPP_INFO(this->get_logger(), "Received new goal: x=%f y=%f", point.x,
+              point.y);
+
   while (!state_cur_) {
     RCLCPP_WARN(this->get_logger(), "Odometry not received yet, waiting...");
     rclcpp::sleep_for(1s);
   }
 
-  RCLCPP_INFO(
-      this->get_logger(),
-      std::string{
-          "Received new goal: " +
-          (goal.position ? ("position: x=" + std::to_string(goal.position->x) +
-                            " y=" + std::to_string(goal.position->y) + " ")
-                         : "") +
-          (goal.heading ? ("heading: x=" + std::to_string(goal.heading->x) +
-                           " y=" + std::to_string(goal.heading->y) + " ")
-                        : "")}
-          .c_str());
+  double ie_s{0.0}, ie_theta{0.0};
+  double e_s{std::numeric_limits<double>::infinity()};
+  bool heading_reached{false};
 
-  double ie_x{0.0}, ie_y{0.0}, ie_theta{0.0};
-  double e_theta{std::numeric_limits<double>::infinity()},
-      ds{std::numeric_limits<double>::infinity()};
-
-  while ((goal.position && ds > kPositionTolerance) ||
-         (goal.heading && std::abs(e_theta) > kAngleTolerance)) {
+  while (e_s > kPositionTolerance) {
     Twist v_d{};
-    if (goal.position && ds > kPositionTolerance) {
-      double e_x{goal.position->x - state_cur_->x};
-      double e_y{goal.position->y - state_cur_->y};
+
+    // heading loop
+    auto theta_goal{
+        std::atan2(point.y - state_cur_->y, point.x - state_cur_->x)};
+    double e_theta{std::atan2(std::sin(theta_goal - state_cur_->theta),
+                              std::cos(theta_goal - state_cur_->theta))};
+    double de_theta{/* dtheta_goal = 0 */ -state_cur_->dtheta};
+    v_d.angular.z = pidStepHeading(e_theta, de_theta, ie_theta);
+    ie_theta += std::chrono::duration<double>{kControlCycle}.count() * e_theta;
+    heading_reached |= std::abs(e_theta) <= kAngleTolerance;
+
+    // position loop
+    if (heading_reached) {
+      double e_x{point.x - state_cur_->x};
+      double e_y{point.y - state_cur_->y};
+      e_s = std::sqrt(e_x * e_x + e_y * e_y);
+
       double de_x{/* dx_goal = 0 */ -state_cur_->dx};
       double de_y{/* dy_goal = 0 */ -state_cur_->dy};
-      ds = std::sqrt(e_x * e_x + e_y * e_y);
-      v_d.linear.x = pidStepPosition(e_x, de_x, ie_x);
-      v_d.linear.y = pidStepPosition(e_y, de_y, ie_y);
-      ie_x += std::chrono::duration<double>{kControlCycle}.count() * e_x;
-      ie_y += std::chrono::duration<double>{kControlCycle}.count() * e_y;
+      double de_s{(e_x * de_x + e_y * de_y) /
+                  (e_s + 0.001)}; // derivative of norm + normalization
+
+      v_d.linear.x = pidStepPosition(e_s, de_s, ie_s);
+      ie_s += std::chrono::duration<double>{kControlCycle}.count() * e_x;
     }
-    if (goal.heading && std::abs(e_theta) > kAngleTolerance) {
-      auto theta_goal{std::atan2(goal.heading->y - state_cur_->y,
-                                 goal.heading->x - state_cur_->x)};
-      e_theta = std::atan2(std::sin(theta_goal - state_cur_->theta),
-                           std::cos(theta_goal - state_cur_->theta));
-      double de_theta{/* dtheta_goal = 0 */ -state_cur_->dtheta};
-      v_d.angular.z = pidStepHeading(e_theta, de_theta, ie_theta);
-      ie_theta +=
-          std::chrono::duration<double>{kControlCycle}.count() * e_theta;
-    }
+
     twist_pub_->publish(v_d);
     rclcpp::sleep_for(kControlCycle);
   }
 
+  // goal reached
   twist_pub_->publish(Twist{});
   RCLCPP_INFO(this->get_logger(), "Reached waypoint.");
   return true;
 }
 
-bool PidMazeSolver::followTrajectory(std::vector<Goal> goals) {
+bool PidMazeSolver::followTrajectory(GoalSequence goals) {
   RCLCPP_INFO(this->get_logger(), "Received new goal trajectory.");
 
   for (const auto &goal : goals) {
@@ -179,10 +172,26 @@ bool PidMazeSolver::followTrajectory(std::vector<Goal> goals) {
   return true;
 }
 
-std::vector<Goal> createGoals() {
-  std::vector<Goal> goals;
+std::string getGoalsYamlFilename() {
+  const std::string package_share_directory{
+      ament_index_cpp::get_package_share_directory("pid_maze_solver")};
+  std::string waypoint_file_name{"sim_points_1.yaml"};
+  const std::string yaml_file{package_share_directory + "/waypoints/" +
+                              waypoint_file_name};
+  return yaml_file;
+}
 
-  // TODO(define goals here)
+GoalSequence loadSetpointsFromYaml(const std::string &yaml_file) {
+  GoalSequence goals{};
+  YAML::Node goals_yaml;
+
+  try {
+    goals_yaml = YAML::LoadFile(yaml_file);
+    goals = goals_yaml["goals"].as<GoalSequence>();
+  } catch (const YAML::Exception &e) {
+    throw std::runtime_error{std::string{"Failed to read YAML file: "} +
+                             e.what()};
+  }
 
   return goals;
 }
@@ -196,7 +205,8 @@ int main(int argc, char **argv) {
   executor.add_node(node);
   auto executor_thread{std::thread([&executor]() { executor.spin(); })};
 
-  const auto goals{PidMazeSolver::createGoals()};
+  const auto goals{PidMazeSolver::loadSetpointsFromYaml(
+      PidMazeSolver::getGoalsYamlFilename())};
   node->followTrajectory(goals);
 
   if (executor_thread.joinable()) {

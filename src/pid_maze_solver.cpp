@@ -78,9 +78,9 @@ private:
   constexpr static double kHeadingIGain{0.01};
   constexpr static double kHeadingPGain{2.0};
   constexpr static double kHeadingDGain{0.3};
-  constexpr static double kPositionIGain{0.05};
+  constexpr static double kPositionIGain{0.03};
   constexpr static double kPositionPGain{1.7};
-  constexpr static double kPositionDGain{0.7};
+  constexpr static double kPositionDGain{0.3};
 
   double pidStepPosition(double e, double de, double ie);
   double pidStepHeading(double e, double de, double ie);
